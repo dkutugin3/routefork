@@ -1,0 +1,76 @@
+name: Publish RouteFork beta
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/prerelease.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: routefork-v1.2.0-beta.1
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: macos-15
+    timeout-minutes: 12
+    env:
+      RELEASE_TAG: v1.2.0-beta.1
+    steps:
+      - name: Fetch release source
+        run: |
+          git init .
+          git fetch --depth=1 --no-tags "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+
+      - name: Verify Xray profiles and build the macOS app
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          curl --fail --location --retry 3 \
+            https://github.com/XTLS/Xray-core/releases/download/v26.10.31/Xray-macos-arm64-v8a.zip \
+            --output build/Xray-macos-arm64-v8a.zip
+          bash build-app.sh build/Xray-macos-arm64-v8a.zip build/RouteFork.app
+          xcrun swiftc -parse-as-library -swift-version 5 -warnings-as-errors \
+            -o build/profile-checks Sources/ProxyProfile.swift Tests/ProfileChecks.swift
+          build/profile-checks build/profiles
+          for profile in build/profiles/*.json; do
+            build/RouteFork.app/Contents/MacOS/xray run -test -config stdin: < "$profile"
+          done
+
+      - name: Package and check the release archive
+        run: |
+          set -euo pipefail
+          mkdir -p dist build/release-check
+          ditto -c -k --sequesterRsrc --keepParent build/RouteFork.app dist/RouteFork-macos-arm64.zip
+          ditto -x -k dist/RouteFork-macos-arm64.zip build/release-check
+          codesign --verify --deep --strict build/release-check/RouteFork.app
+          (cd dist && shasum -a 256 RouteFork-macos-arm64.zip > SHA256SUMS.txt)
+
+      - name: Publish the prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if release=$(gh release view "$RELEASE_TAG" --json isDraft,targetCommitish \
+            --jq '[.isDraft, .targetCommitish] | @tsv' 2>/dev/null); then
+            IFS=$'\t' read -r draft target <<< "$release"
+            if [[ "$draft" != true ]]; then
+              gh release view "$RELEASE_TAG" --json url --jq .url
+              exit 0
+            fi
+            if [[ "$target" != "$GITHUB_SHA" ]]; then
+              echo "Draft targets $target. Rerun that commit to finish publishing."
+              exit 1
+            fi
+            gh release upload "$RELEASE_TAG" dist/RouteFork-macos-arm64.zip dist/SHA256SUMS.txt --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/RouteFork-macos-arm64.zip dist/SHA256SUMS.txt \
+              --target "$GITHUB_SHA" --title "RouteFork 1.2.0 beta 1" --notes-file RELEASE.md \
+              --prerelease --latest=false --draft
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false
